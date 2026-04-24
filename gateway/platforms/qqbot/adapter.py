@@ -402,14 +402,54 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                 if not self._running:
                     return
                 logger.warning("[%s] WebSocket error: %s", self._log_tag, exc)
+                # Quick disconnect detection — mirrors the QQCloseError handler
+                duration = time.monotonic() - connect_time
+                if duration < QUICK_DISCONNECT_THRESHOLD and connect_time > 0:
+                    quick_disconnect_count += 1
+                    logger.info(
+                        "[%s] Quick disconnect (%.1fs), count: %d",
+                        self._log_tag,
+                        duration,
+                        quick_disconnect_count,
+                    )
+                    if quick_disconnect_count >= MAX_QUICK_DISCONNECT_COUNT:
+                        logger.error(
+                            "[%s] Too many quick disconnects. "
+                            "Check: 1) AppID/Secret correct 2) Bot permissions "
+                            "3) Network / firewall stability",
+                            self._log_tag,
+                        )
+                        self._set_fatal_error(
+                            "qq_quick_disconnect",
+                            "Too many quick disconnects — check bot permissions or network",
+                            retryable=True,
+                        )
+                        return
+                else:
+                    quick_disconnect_count = 0
+
                 self._mark_transport_disconnected()
                 self._fail_pending("Connection interrupted")
 
                 if backoff_idx >= MAX_RECONNECT_ATTEMPTS:
                     logger.error("[%s] Max reconnect attempts reached", self._log_tag)
-                    self._mark_disconnected()
+                    self._set_fatal_error(
+                        "qq_reconnect_exhausted",
+                        "Max reconnect attempts reached",
+                        retryable=True,
+                    )
                     return
-                await reconnect()
+
+                if await self._reconnect(backoff_idx):
+                    backoff_idx = 0
+                    # Intentionally NOT resetting quick_disconnect_count here.
+                    # The reconnect() closure resets it alongside backoff_idx,
+                    # which defeats the bound above: a reconnect that "succeeds"
+                    # but whose WebSocket immediately closes would zero the
+                    # counter on every cycle and loop forever. Keeping it lets
+                    # MAX_QUICK_DISCONNECT_COUNT terminate the retry storm.
+                else:
+                    backoff_idx += 1
 
     async def _reconnect(self, backoff_idx: int) -> bool:
         delay = RECONNECT_BACKOFF[min(backoff_idx, len(RECONNECT_BACKOFF) - 1)]
@@ -419,6 +459,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
         self._heartbeat_interval = 30.0  # reset until Hello
         try:
             await self._open_gateway_ws()
+            # Recreate the heartbeat task: it is cancelled on disconnect and
+            # _open_gateway_ws() only restores the socket, not the heartbeat.
+            if self._heartbeat_task is None or self._heartbeat_task.done():
+                self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
             self._mark_connected()
             logger.info("[%s] Reconnected", self._log_tag)
             return True
@@ -434,8 +478,17 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
             # read and retry with backoff reset → 100% CPU spin. Raise instead.
             raise RuntimeError("WebSocket closed")
 
+        receive_timeout = self._heartbeat_interval * 3
         while self._running and self._ws and not self._ws.closed:
-            msg = await self._ws.receive()
+            try:
+                msg = await asyncio.wait_for(self._ws.receive(), timeout=receive_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] WebSocket receive timeout (%.1fs), connection may be stale",
+                    self._log_tag,
+                    receive_timeout,
+                )
+                raise RuntimeError("WebSocket receive timeout")
             if msg.type == aiohttp.WSMsgType.TEXT:
                 payload = self._parse_json(msg.data)
                 if payload:
@@ -447,6 +500,10 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
 
     async def _heartbeat_loop(self) -> None:
         """Send op 1 heartbeats with the latest seq at 80% of the Hello interval."""
+        heartbeat_fail_count = 0
+        heartbeat_success_count = 0
+        MAX_HEARTBEAT_FAILS = 3
+        HEARTBEAT_LOG_INTERVAL = 5  # Log every 5th successful heartbeat (~5 min)
         with contextlib.suppress(asyncio.CancelledError):
             while self._running:
                 await asyncio.sleep(self._heartbeat_interval)
@@ -454,8 +511,35 @@ class QQAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
                     continue
                 try:
                     await self._ws.send_json({"op": 1, "d": self._last_seq})
+                    heartbeat_fail_count = 0  # Reset on success
+                    heartbeat_success_count += 1
+                    if heartbeat_success_count % HEARTBEAT_LOG_INTERVAL == 0:
+                        logger.info(
+                            "[%s] Heartbeat OK (count=%d)",
+                            self._log_tag,
+                            heartbeat_success_count,
+                        )
                 except Exception as exc:
-                    logger.debug("[%s] Heartbeat failed: %s", self._log_tag, exc)
+                    heartbeat_fail_count += 1
+                    logger.warning(
+                        "[%s] Heartbeat failed (%d/%d): %s",
+                        self._log_tag,
+                        heartbeat_fail_count,
+                        MAX_HEARTBEAT_FAILS,
+                        exc,
+                    )
+                    if heartbeat_fail_count >= MAX_HEARTBEAT_FAILS:
+                        logger.error(
+                            "[%s] Too many heartbeat failures, forcing disconnect",
+                            self._log_tag,
+                        )
+                        self._mark_disconnected()
+                        if self._ws and not self._ws.closed:
+                            try:
+                                await self._ws.close()
+                            except Exception:
+                                pass
+                        break
 
     async def _send_ws_auth(self, name: str, payload: Dict[str, Any], sent_msg: str, *log_args) -> bool:
         """Send an Identify/Resume payload; returns False if the send raised."""
