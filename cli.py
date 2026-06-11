@@ -47,6 +47,7 @@ from hermes_cli.cli_tui_mixin import CLITuiMixin
 from hermes_cli.cli_process_notifications import CLIProcessNotificationsMixin
 from agent.interrupt_compat import request_hard_interrupt
 from agent.pet import render as pet_render
+from agent.think_scrubber import normalize_gemma_channel_tokens
 
 from prompt_toolkit.patch_stdout import patch_stdout
 from prompt_toolkit.application import Application
@@ -187,11 +188,17 @@ def _strip_reasoning_tags(text: str) -> str:
 
     Keep in sync with ``agent.agent_runtime_helpers.strip_think_blocks`` and the stream consumer's think-tag sets.
 
+    Covers the variants emitted by reasoning models today: ``<think>``, ``<thinking>``,
+    ``<reasoning>``, ``<REASONING_SCRATCHPAD>``, ``<thought>`` (Gemma 4), and Gemma 4's
+    non-standard ``<|channel>thought`` / ``<channel|>`` control tokens.
+
     Also strips tool-call XML blocks some open models leak into visible content (``<tool_call>``,
     ``<function_calls>``, Gemma-style ``<function name="…">…</function>``). Ported from
     openclaw/openclaw#67318.
     """
-    cleaned = text
+    # Gemma 4 delimits reasoning with control tokens rather than angle-bracket tags; normalize
+    # them to <think>/</think> FIRST so the tag loop below strips them with every other variant.
+    cleaned = normalize_gemma_channel_tokens(text)
     for tag in _REASONING_TAGS:
         cleaned = re.sub(rf"<{tag}>.*?</{tag}>\s*", "", cleaned, flags=re.DOTALL | re.IGNORECASE)
         cleaned = re.sub(rf"<{tag}>.*$", "", cleaned, flags=re.DOTALL | re.IGNORECASE)

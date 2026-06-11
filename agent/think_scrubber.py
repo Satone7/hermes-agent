@@ -13,7 +13,10 @@ from __future__ import annotations
 import re
 from typing import Tuple
 
-__all__ = ["StreamingThinkScrubber", "THINK_TAG_NAMES", "THINK_OPEN_TAGS", "THINK_CLOSE_TAGS"]
+__all__ = [
+    "StreamingThinkScrubber", "THINK_TAG_NAMES", "THINK_OPEN_TAGS", "THINK_CLOSE_TAGS",
+    "GEMMA_CHANNEL_OPEN", "GEMMA_CHANNEL_CLOSE", "normalize_gemma_channel_tokens",
+]
 
 # The one list of model reasoning tag names. Every surface that hides reasoning (this scrubber,
 # the CLI stream filter, the gateway stream filter, the final-response regex stripper) binds to
@@ -22,6 +25,25 @@ __all__ = ["StreamingThinkScrubber", "THINK_TAG_NAMES", "THINK_OPEN_TAGS", "THIN
 THINK_TAG_NAMES: Tuple[str, ...] = ("think", "thinking", "reasoning", "thought", "REASONING_SCRATCHPAD")
 THINK_OPEN_TAGS: Tuple[str, ...] = tuple(f"<{name.lower()}>" for name in THINK_TAG_NAMES)
 THINK_CLOSE_TAGS: Tuple[str, ...] = tuple(f"</{name.lower()}>" for name in THINK_TAG_NAMES)
+
+# Gemma 4 (via local providers such as LM Studio) does not use angle-bracket tags for reasoning:
+# it delimits the block with the control tokens ``<|channel>thought`` … ``<channel|>``.  They are
+# deliberately NOT entries in THINK_TAG_NAMES: the ``<name>``/``</name>`` shape those names are
+# interpolated into cannot express this open/close pair.  Every reasoning surface instead
+# normalizes the tokens to ``<think>``/``</think>`` up front and reuses the shared tag machinery.
+GEMMA_CHANNEL_OPEN = "<|channel>thought"
+GEMMA_CHANNEL_CLOSE = "<channel|>"
+
+
+def normalize_gemma_channel_tokens(text: str) -> str:
+    """Rewrite Gemma 4 reasoning control tokens to the standard ``<think>``/``</think>`` tags.
+
+    Idempotent, and cheap enough to run per delta.  Both replacements are single passes, so a
+    ``<channel|>`` that arrives before its opener is closed and cannot swallow later prose.
+    """
+    if "<|channel>thought" not in text and "<channel|>" not in text:
+        return text
+    return text.replace(GEMMA_CHANNEL_OPEN, "<think>").replace(GEMMA_CHANNEL_CLOSE, "</think>")
 
 
 class StreamingThinkScrubber:
@@ -35,8 +57,14 @@ class StreamingThinkScrubber:
     # Literal tags so the hot path does string ops, not regex per feed().
     _OPEN_TAGS: Tuple[str, ...] = THINK_OPEN_TAGS
     _CLOSE_TAGS: Tuple[str, ...] = THINK_CLOSE_TAGS
-    _ALL_TAGS: Tuple[str, ...] = _OPEN_TAGS + _CLOSE_TAGS
-    _MAX_TAG_LEN: int = max(len(tag) for tag in _ALL_TAGS)
+    # Partial-tag holding also covers the Gemma control tokens, which normalize to <think>/
+    # </think> on entry — without them a token split across deltas would be emitted verbatim.
+    _PARTIAL_TAGS: Tuple[str, ...] = _OPEN_TAGS + _CLOSE_TAGS + (GEMMA_CHANNEL_OPEN, GEMMA_CHANNEL_CLOSE)
+    # While inside a block the closes to watch for are the </think> forms plus the RAW Gemma
+    # close token: normalization runs on the reassembled buffer, so a `<chan` fragment must be
+    # held verbatim until its `nel|>` half arrives and the pair can be rewritten.
+    _PARTIAL_CLOSE_TAGS: Tuple[str, ...] = _CLOSE_TAGS + (GEMMA_CHANNEL_CLOSE,)
+    _MAX_TAG_LEN: int = max(len(tag) for tag in _PARTIAL_TAGS)
     # Orphan close tag plus trailing whitespace (matches _strip_think_blocks case 3).
     _ORPHAN_CLOSE_RE = re.compile(
         "(?:" + "|".join(re.escape(t) for t in _CLOSE_TAGS) + r")[ \t\n\r]*", re.IGNORECASE
@@ -62,8 +90,12 @@ class StreamingThinkScrubber:
         """Feed one delta; return the scrubbed visible portion ("" when it is all reasoning or held back)."""
         if not text:
             return ""
+        # Rejoin the held-back tail BEFORE normalizing: a Gemma control token split across
+        # deltas sits half in _buf and half in text, so only the reassembled string can be
+        # rewritten to <think>/</think> in one piece.
         buf = self._buf + text
         self._buf = ""
+        buf = normalize_gemma_channel_tokens(buf)
         out: list[str] = []
 
         while buf:
@@ -71,7 +103,7 @@ class StreamingThinkScrubber:
                 close_idx, close_len = self._find_first_tag(buf, self._CLOSE_TAGS)
                 if close_idx == -1:
                     # No close yet: hold back a possible partial close-tag prefix, drop the rest.
-                    self._hold_partial(buf, self._CLOSE_TAGS)
+                    self._hold_partial(buf, self._PARTIAL_CLOSE_TAGS)
                     break
                 buf = buf[close_idx + close_len:]
                 self._in_block = False
@@ -94,7 +126,7 @@ class StreamingThinkScrubber:
 
             # No resolvable tag: hold back any partial-tag prefix at the tail
             # so a tag split across deltas isn't missed, then emit the rest.
-            self._emit(out, self._hold_partial(buf, self._ALL_TAGS))
+            self._emit(out, self._hold_partial(buf, self._PARTIAL_TAGS))
             break
 
         return "".join(out)

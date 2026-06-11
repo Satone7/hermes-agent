@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import logging
 
-from agent.think_scrubber import THINK_CLOSE_TAGS, THINK_OPEN_TAGS
+from agent.think_scrubber import (
+    GEMMA_CHANNEL_OPEN, THINK_CLOSE_TAGS, THINK_OPEN_TAGS, normalize_gemma_channel_tokens,
+)
+
 from agent.think_scrubber import StreamingThinkScrubber as _Scrubber
 
 logger = logging.getLogger("gateway.stream_consumer")
@@ -20,6 +23,10 @@ class StreamThinkFilterMixin:
 
     _OPEN_THINK_TAGS = THINK_OPEN_TAGS
     _CLOSE_THINK_TAGS = THINK_CLOSE_TAGS
+    # Hold-back candidates for a partial opener at the buffer tail.  The Gemma control token
+    # normalizes to <think> only once complete, so its fragments must be held too — otherwise a
+    # deltas-split token emits its leading "<|chan" as visible text before the rewrite can fire.
+    _PARTIAL_OPEN_TOKENS = THINK_OPEN_TAGS + (GEMMA_CHANNEL_OPEN,)
 
     def _at_block_boundary(self, buf: str, idx: int) -> bool:
         """Tag at ``idx`` starts a block: start of text, or newline + optional whitespace.
@@ -55,7 +62,10 @@ class StreamThinkFilterMixin:
         Partial tags at buffer boundaries are held in ``_think_buffer`` until
         enough characters arrive to decide.
         """
-        buf = self._think_buffer + text
+        # Gemma 4 marks reasoning with control tokens rather than angle-bracket tags; rewrite
+        # them to <think>/</think> here so the shared state machine handles them transparently.
+        # A token split across deltas stays in _think_buffer (see _PARTIAL_TAGS) until resolved.
+        buf = normalize_gemma_channel_tokens(self._think_buffer + text)
         self._think_buffer = ""
 
         while buf:
@@ -67,7 +77,9 @@ class StreamThinkFilterMixin:
                     self._in_think_block = False
                     buf = buf[best_idx + best_len:]
                 else:
-                    # Hold a tail that could be a partial close tag; discard the rest.
+                    # Hold a tail that could be a partial close tag; discard the rest. A RAW
+                    # Gemma close fragment (`<chan`) is covered by the same window: normalization
+                    # runs on the reassembled buffer, and the token is no longer than </think>.
                     max_tag = max(len(t) for t in self._CLOSE_THINK_TAGS)
                     self._think_buffer = buf[-max_tag:] if len(buf) > max_tag else buf
                     return
@@ -79,7 +91,7 @@ class StreamThinkFilterMixin:
                     buf = buf[best_idx + best_len:]
                 else:
                     # Hold back a partial open tag at the tail.
-                    held_back = _Scrubber._max_partial_suffix(buf, self._OPEN_THINK_TAGS)
+                    held_back = _Scrubber._max_partial_suffix(buf, self._PARTIAL_OPEN_TOKENS)
                     if held_back:
                         self._append_accumulated(buf[:-held_back])
                         self._think_buffer = buf[-held_back:]

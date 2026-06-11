@@ -21,7 +21,7 @@ from agent.message_sanitization import (
 )
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
-from agent.think_scrubber import THINK_TAG_NAMES
+from agent.think_scrubber import THINK_TAG_NAMES, normalize_gemma_channel_tokens
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
     STATUS_EXHAUSTED, _parse_absolute_timestamp, credential_pool_entry_serves_endpoint,
@@ -635,8 +635,14 @@ def strip_think_blocks(agent, content: str) -> str:
     """Remove reasoning/thinking blocks from content, returning only visible text: closed tag
     pairs, unterminated open tags at a block boundary (mirrors ``gateway/stream_consumer.py``),
     stray orphan tags (all case-insensitive variants), and standalone tool-call XML blocks some
-    open models emit; ``<function>`` is boundary- and ``name=``-gated so prose mentions survive."""
+    open models emit; ``<function>`` is boundary- and ``name=``-gated so prose mentions survive.
+
+    Gemma 4 delimits reasoning with the control tokens ``<|channel>thought`` / ``<channel|>``
+    rather than angle-bracket tags; they are normalized to ``<think>``/``</think>`` before the
+    pattern pass so the shared tag machinery strips them like any other variant."""
     content = _flatten_content_text(content) if content else ""
+    if content:
+        content = normalize_gemma_channel_tokens(content)
     for pattern in _THINK_STRIP_PATTERNS if content else ():
         content = pattern.sub('', content)
     return content
