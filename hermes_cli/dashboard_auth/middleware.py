@@ -206,6 +206,15 @@ def _auto_sso_response(request: Request) -> Response | None:
     # list_session_providers() already filters on supports_session=True, so
     # token-only credentials (drain/service providers) are never candidates.
     providers = list_session_providers()
+    # Auto-SSO relies on the OAuth/PKCE redirect in /auth/login calling
+    # start_login(). A password-only provider (supports_password, no OAuth
+    # flow) raises NotImplementedError there → 500. Only providers that
+    # actually offer a redirect flow are valid auto-SSO targets; a lone
+    # password provider must fall through to the /login interstitial.
+    providers = [
+        p for p in providers
+        if not getattr(p, "supports_password", False)
+    ]
     if len(providers) != 1:
         # Zero → nothing to redirect to. Two+ → user must choose at /login.
         return None
