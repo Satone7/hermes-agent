@@ -221,7 +221,39 @@ def extract_tar(archive: Path | IO[bytes], dest: Path) -> None:
     real_dest = os.path.realpath(dest)
     opened = tarfile.open(archive) if isinstance(archive, (str, os.PathLike)) else tarfile.open(fileobj=archive)
     with opened as tf:
-        tf.extractall(dest, filter=lambda member, path: _tar_filter(member, real_dest))
+        if hasattr(tarfile, "data_filter"):
+            tf.extractall(dest, filter=lambda member, path: _tar_filter(member, real_dest))
+        else:
+            # Python < 3.11.4 predates the extraction-filter API (backported to 3.11.4, native in 3.12):
+            # extractall() takes no filter= and _tar_filter()'s tarfile.data_filter is absent. The PM
+            # bootstraps a managed interpreter from this very path, so it must run on the host one —
+            # enforce the same containment policy by hand, then extract unfiltered.
+            _guard_members_legacy(tf, real_dest)
+            tf.extractall(dest)
+
+
+def _guard_members_legacy(tf, real_dest: str) -> None:
+    """Pre-flight containment check for interpreters without ``tarfile.data_filter``
+    (Python < 3.11.4): reject absolute/``..`` member paths and any symlink/hardlink whose
+    resolved target escapes ``dest``, mirroring ``_tar_filter``'s policy. Symlinks resolve
+    from the link's own directory (python-build-standalone's terminfo links need that);
+    hard links are archive-root relative, as the stdlib data filter treats them."""
+    import tarfile
+
+    for member in tf.getmembers():
+        name = member.name.rstrip("/")
+        if os.path.isabs(name) or ".." in Path(name).parts:
+            raise tarfile.ExtractError(f"refusing to extract unsafe path: {member.name!r}")
+        placement = os.path.realpath(os.path.join(real_dest, name))
+        if os.path.commonpath([placement, real_dest]) != real_dest:
+            raise tarfile.ExtractError(f"member escapes destination: {member.name!r}")
+        if member.issym() or member.islnk():
+            if os.path.isabs(member.linkname):
+                raise tarfile.ExtractError(f"absolute link target: {member.linkname!r}")
+            base = os.path.dirname(name) if member.issym() else ""
+            target = os.path.realpath(os.path.join(real_dest, base, member.linkname))
+            if os.path.commonpath([target, real_dest]) != real_dest:
+                raise tarfile.ExtractError(f"link escapes destination: {member.linkname!r}")
 
 
 def extract(archive: Path, dest: Path) -> None:
